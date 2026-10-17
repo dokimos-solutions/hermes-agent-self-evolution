@@ -152,6 +152,31 @@ class TestGEPAOnSkillSet:
         assert student.skill_texts() == {"producer": PRODUCER, "consumer": CONSUMER}
 
 
+def test_runner_base_exception_stops_gepa(toy_skills, tmp_path):
+    """A budget stop raised by the runner as BaseException must end compile(), not be scored as failure."""
+    class Stop(BaseException):
+        pass
+
+    calls = []
+
+    def capped_runner(cand_dir, files, inputs):
+        calls.append(1)
+        if len(calls) > 4:
+            raise Stop("token cap")
+        return toy_runner(cand_dir, files, inputs)
+
+    def reflect(messages):
+        return json.dumps({"new_instruction": PRODUCER + " INCLUDE_FIELDS"})
+
+    student = SkillSetModule(toy_skills, capped_runner, candidate_root=tmp_path / "c")
+    opt = evolve_skill.build_optimizer("gepa", metric=toy_metric, reflection_lm=StubLM(reflect),
+                                       max_metric_calls=200, use_merge=False)
+    with pytest.raises(Stop):
+        opt.compile(student, trainset=examples(4), valset=examples(3))
+    # stopped at the first refused call (an already-started parallel call may also hit the stop)
+    assert 5 <= len(calls) <= 7
+
+
 def test_evolve_skill_set_end_to_end_writes_evolved_set(tmp_path, monkeypatch):
     from evolution.skills.evolve_skill_set import evolve_skill_set
     monkeypatch.setattr(socket.socket, "connect", lambda *a: pytest.fail("network"))
