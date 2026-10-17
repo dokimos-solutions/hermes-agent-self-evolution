@@ -23,6 +23,7 @@ from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset,
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, skill_feedback_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.lm import make_lm
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -87,6 +88,10 @@ def evolve(
     dry_run: bool = False,
     optimizer: str = "gepa",
     max_metric_calls: Optional[int] = None,
+    optimizer_api_base: Optional[str] = None,
+    optimizer_api_key: Optional[str] = None,
+    eval_api_base: Optional[str] = None,
+    eval_api_key: Optional[str] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -182,7 +187,7 @@ def evolve(
     console.print(f"  Eval model: {eval_model}")
 
     # Configure DSPy
-    lm = dspy.LM(eval_model)
+    lm = make_lm(eval_model, api_base=eval_api_base, api_key=eval_api_key)
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -194,7 +199,8 @@ def evolve(
 
     # ── 5. Run optimization ─────────────────────────────────────────────
     if optimizer == "gepa":
-        reflection_lm = dspy.LM(optimizer_model, temperature=1.0, max_tokens=32000)
+        reflection_lm = make_lm(optimizer_model, api_base=optimizer_api_base, api_key=optimizer_api_key,
+                                temperature=1.0, max_tokens=32000)
         budget = max_metric_calls or default_max_metric_calls(iterations, len(trainset), len(valset))
         console.print(f"  Metric-call budget: {budget}")
         opt = build_optimizer(
@@ -343,10 +349,19 @@ def evolve(
 @click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
 @click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
+@click.option("--optimizer-api-base", default=None, envvar="EVOLUTION_OPTIMIZER_API_BASE",
+              help="OpenAI-compatible base URL (ending in /v1) for the reflection model")
+@click.option("--optimizer-api-key", default=None, envvar="EVOLUTION_OPTIMIZER_API_KEY",
+              help="API key for --optimizer-api-base (prefer the env var)")
+@click.option("--eval-api-base", default=None, envvar="EVOLUTION_EVAL_API_BASE",
+              help="OpenAI-compatible base URL (ending in /v1) for the eval model")
+@click.option("--eval-api-key", default=None, envvar="EVOLUTION_EVAL_API_KEY",
+              help="API key for --eval-api-base (prefer the env var)")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 def main(skill, iterations, optimizer, max_metric_calls, eval_source, dataset_path, optimizer_model,
-         eval_model, hermes_repo, run_tests, dry_run):
+         eval_model, hermes_repo, optimizer_api_base, optimizer_api_key, eval_api_base, eval_api_key,
+         run_tests, dry_run):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -360,6 +375,10 @@ def main(skill, iterations, optimizer, max_metric_calls, eval_source, dataset_pa
         dry_run=dry_run,
         optimizer=optimizer,
         max_metric_calls=max_metric_calls,
+        optimizer_api_base=optimizer_api_base,
+        optimizer_api_key=optimizer_api_key,
+        eval_api_base=eval_api_base,
+        eval_api_key=eval_api_key,
     )
 
 
