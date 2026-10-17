@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
+from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path, _discover_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, skill_feedback_metric, LLMJudge, FitnessScore
@@ -28,6 +28,7 @@ from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
     find_skill,
+    resolve_skill_path,
     reassemble_skill,
 )
 
@@ -92,11 +93,16 @@ def evolve(
     optimizer_api_key: Optional[str] = None,
     eval_api_base: Optional[str] = None,
     eval_api_key: Optional[str] = None,
+    skill_path_arg: Optional[str] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
     config = EvolutionConfig(
-        hermes_agent_path=resolve_hermes_agent_path(hermes_repo),
+        hermes_agent_path=(
+            resolve_hermes_agent_path(hermes_repo)
+            if (hermes_repo or not skill_path_arg)
+            else _discover_hermes_agent_path()  # optional when --skill-path is given
+        ),
         iterations=iterations,
         optimizer_model=optimizer_model,
         eval_model=eval_model,
@@ -105,15 +111,18 @@ def evolve(
     )
 
     # ── 1. Find and load the skill ──────────────────────────────────────
-    console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
+    console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name or skill_path_arg}[/bold]\n")
 
-    skill_path = find_skill(skill_name, config.hermes_agent_path)
+    skill_path = resolve_skill_path(
+        skill_name, config.hermes_agent_path, Path(skill_path_arg) if skill_path_arg else None)
     if not skill_path:
-        console.print(f"[red]✗ Skill '{skill_name}' not found in {config.hermes_agent_path / 'skills'}[/red]")
+        where = skill_path_arg or (config.hermes_agent_path / "skills")
+        console.print(f"[red]✗ Skill '{skill_name}' not found in {where}[/red]")
         sys.exit(1)
 
     skill = load_skill(skill_path)
-    console.print(f"  Loaded: {skill_path.relative_to(config.hermes_agent_path)}")
+    skill_name = skill_name or skill["name"] or skill_path.parent.name
+    console.print(f"  Loaded: {skill_path}")
     console.print(f"  Name: {skill['name']}")
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
@@ -337,7 +346,10 @@ def evolve(
 
 
 @click.command()
-@click.option("--skill", required=True, help="Name of the skill to evolve")
+@click.option("--skill", default=None, help="Name of the skill to evolve")
+@click.option("--skill-path", default=None, type=click.Path(exists=True),
+              help="SKILL.md file, skill directory, or a directory of skills to search "
+                   "(instead of <hermes-repo>/skills)")
 @click.option("--iterations", default=10, help="Reflection rounds; sets the default GEPA budget")
 @click.option("--optimizer", default="gepa", type=click.Choice(list(OPTIMIZERS)),
               help="Optimizer to run. No silent fallback between them.")
@@ -359,12 +371,15 @@ def evolve(
               help="API key for --eval-api-base (prefer the env var)")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, optimizer, max_metric_calls, eval_source, dataset_path, optimizer_model,
+def main(skill, skill_path, iterations, optimizer, max_metric_calls, eval_source, dataset_path, optimizer_model,
          eval_model, hermes_repo, optimizer_api_base, optimizer_api_key, eval_api_base, eval_api_key,
          run_tests, dry_run):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
+    if not skill and not skill_path:
+        raise click.UsageError("Give --skill, --skill-path, or both.")
     evolve(
         skill_name=skill,
+        skill_path_arg=skill_path,
         iterations=iterations,
         eval_source=eval_source,
         dataset_path=dataset_path,

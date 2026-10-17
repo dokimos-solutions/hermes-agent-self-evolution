@@ -55,16 +55,15 @@ def load_skill(skill_path: Path) -> dict:
     }
 
 
-def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
-    """Find a skill by name in the hermes-agent skills directory.
+def find_skill_in_dir(skill_name: str, skills_dir: Path) -> Optional[Path]:
+    """Search ``skills_dir`` recursively for the skill's SKILL.md.
 
-    Searches recursively for a SKILL.md in a directory matching the skill name.
+    Matches the parent directory name first, then the frontmatter ``name``.
     """
-    skills_dir = hermes_agent_path / "skills"
-    if not skills_dir.exists():
+    if not skills_dir.is_dir():
         return None
 
-    # Direct match: skills/<category>/<skill_name>/SKILL.md
+    # Direct match: <skills_dir>/**/<skill_name>/SKILL.md
     for skill_md in skills_dir.rglob("SKILL.md"):
         if skill_md.parent.name == skill_name:
             return skill_md
@@ -79,6 +78,41 @@ def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
             continue
 
     return None
+
+
+def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
+    """Find a skill by name in the hermes-agent skills directory.
+
+    Searches recursively for a SKILL.md in a directory matching the skill name.
+    """
+    return find_skill_in_dir(skill_name, hermes_agent_path / "skills")
+
+
+def resolve_skill_path(
+    skill_name: Optional[str],
+    hermes_agent_path: Optional[Path] = None,
+    skill_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Locate a SKILL.md, honouring an explicit ``--skill-path``.
+
+    ``skill_path`` may be:
+      * a SKILL.md file (used as-is; ``skill_name`` may be None),
+      * a skill directory containing SKILL.md,
+      * any directory of skills, searched for ``skill_name``.
+    Without ``skill_path``, searches ``<hermes_agent_path>/skills``.
+    """
+    if skill_path is not None:
+        p = Path(skill_path).expanduser()
+        if p.is_file():
+            return p
+        if (p / "SKILL.md").is_file():
+            return p / "SKILL.md"
+        if skill_name:
+            return find_skill_in_dir(skill_name, p)
+        return None
+    if hermes_agent_path is None or not skill_name:
+        return None
+    return find_skill(skill_name, hermes_agent_path)
 
 
 class SkillModule(dspy.Module):
