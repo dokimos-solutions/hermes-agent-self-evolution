@@ -21,7 +21,7 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import skill_fitness_metric, skill_feedback_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -31,6 +31,48 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+OPTIMIZERS = ("gepa", "mipro")
+
+
+def default_max_metric_calls(iterations: int, n_train: int, n_val: int) -> int:
+    """GEPA budget when --max-metric-calls is not given.
+
+    Roughly ``iterations`` reflection rounds, each costing one minibatch on
+    train plus one full pass over val.
+    """
+    return max(1, iterations) * (min(3, max(1, n_train)) + max(1, n_val))
+
+
+def build_optimizer(
+    optimizer: str,
+    *,
+    metric,
+    reflection_lm=None,
+    max_metric_calls: Optional[int] = None,
+):
+    """Build the requested DSPy optimizer. Never falls back silently.
+
+    gepa:  dspy.GEPA(metric=<5-arg score+feedback metric>,
+                     reflection_lm=<--optimizer-model LM>,
+                     max_metric_calls=<budget>)
+    mipro: dspy.MIPROv2(metric=..., auto="light")
+
+    Any construction error propagates: a GEPA run must be a GEPA run.
+    """
+    if optimizer == "gepa":
+        if reflection_lm is None:
+            raise ValueError("GEPA needs a reflection LM (--optimizer-model).")
+        if not max_metric_calls or max_metric_calls < 1:
+            raise ValueError("GEPA needs a positive metric-call budget (--max-metric-calls).")
+        return dspy.GEPA(
+            metric=metric,
+            reflection_lm=reflection_lm,
+            max_metric_calls=max_metric_calls,
+        )
+    if optimizer == "mipro":
+        return dspy.MIPROv2(metric=metric, auto="light")
+    raise ValueError(f"Unknown optimizer {optimizer!r}; choose one of {OPTIMIZERS}.")
 
 
 def evolve(
@@ -43,6 +85,8 @@ def evolve(
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    optimizer: str = "gepa",
+    max_metric_calls: Optional[int] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -118,7 +162,8 @@ def evolve(
     # ── 3. Validate constraints on baseline ─────────────────────────────
     console.print(f"\n[bold]Validating baseline constraints[/bold]")
     validator = ConstraintValidator(config)
-    baseline_constraints = validator.validate_all(skill["body"], "skill")
+    # Structure checks need the frontmatter, so validate the full file.
+    baseline_constraints = validator.validate_all(skill["raw"], "skill")
     all_pass = True
     for c in baseline_constraints:
         icon = "✓" if c.passed else "✗"
@@ -130,9 +175,9 @@ def evolve(
     if not all_pass:
         console.print("[yellow]⚠ Baseline skill has constraint violations — proceeding anyway[/yellow]")
 
-    # ── 4. Set up DSPy + GEPA optimizer ─────────────────────────────────
+    # ── 4. Set up DSPy + optimizer ──────────────────────────────────────
     console.print(f"\n[bold]Configuring optimizer[/bold]")
-    console.print(f"  Optimizer: GEPA ({iterations} iterations)")
+    console.print(f"  Optimizer: {optimizer}")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
 
@@ -147,33 +192,25 @@ def evolve(
     trainset = dataset.to_dspy_examples("train")
     valset = dataset.to_dspy_examples("val")
 
-    # ── 5. Run GEPA optimization ────────────────────────────────────────
-    console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
+    # ── 5. Run optimization ─────────────────────────────────────────────
+    if optimizer == "gepa":
+        reflection_lm = dspy.LM(optimizer_model, temperature=1.0, max_tokens=32000)
+        budget = max_metric_calls or default_max_metric_calls(iterations, len(trainset), len(valset))
+        console.print(f"  Metric-call budget: {budget}")
+        opt = build_optimizer(
+            "gepa",
+            metric=skill_feedback_metric,
+            reflection_lm=reflection_lm,
+            max_metric_calls=budget,
+        )
+        compile_kwargs = dict(trainset=trainset, valset=valset)
+    else:
+        opt = build_optimizer(optimizer, metric=skill_fitness_metric)
+        compile_kwargs = dict(trainset=trainset)
 
+    console.print(f"\n[bold cyan]Running {optimizer} optimization...[/bold cyan]\n")
     start_time = time.time()
-
-    try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
-        )
-
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+    optimized_module = opt.compile(baseline_module, **compile_kwargs)
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -185,7 +222,7 @@ def evolve(
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_body, "skill", baseline_text=skill["body"])
+    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -267,6 +304,7 @@ def evolve(
         "skill_name": skill_name,
         "timestamp": timestamp,
         "iterations": iterations,
+        "optimizer": optimizer,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,
         "baseline_score": avg_baseline,
@@ -294,7 +332,11 @@ def evolve(
 
 @click.command()
 @click.option("--skill", required=True, help="Name of the skill to evolve")
-@click.option("--iterations", default=10, help="Number of GEPA iterations")
+@click.option("--iterations", default=10, help="Reflection rounds; sets the default GEPA budget")
+@click.option("--optimizer", default="gepa", type=click.Choice(list(OPTIMIZERS)),
+              help="Optimizer to run. No silent fallback between them.")
+@click.option("--max-metric-calls", default=None, type=int,
+              help="GEPA budget: total metric calls (default derived from --iterations)")
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
@@ -303,7 +345,8 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+def main(skill, iterations, optimizer, max_metric_calls, eval_source, dataset_path, optimizer_model,
+         eval_model, hermes_repo, run_tests, dry_run):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -315,6 +358,8 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        optimizer=optimizer,
+        max_metric_calls=max_metric_calls,
     )
 
 
