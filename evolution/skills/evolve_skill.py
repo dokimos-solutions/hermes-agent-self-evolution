@@ -53,12 +53,13 @@ def build_optimizer(
     metric,
     reflection_lm=None,
     max_metric_calls: Optional[int] = None,
+    **gepa_extra,
 ):
     """Build the requested DSPy optimizer. Never falls back silently.
 
     gepa:  dspy.GEPA(metric=<5-arg score+feedback metric>,
                      reflection_lm=<--optimizer-model LM>,
-                     max_metric_calls=<budget>)
+                     max_metric_calls=<budget>, **gepa_extra)
     mipro: dspy.MIPROv2(metric=..., auto="light")
 
     Any construction error propagates: a GEPA run must be a GEPA run.
@@ -72,6 +73,7 @@ def build_optimizer(
             metric=metric,
             reflection_lm=reflection_lm,
             max_metric_calls=max_metric_calls,
+            **gepa_extra,
         )
     if optimizer == "mipro":
         return dspy.MIPROv2(metric=metric, auto="light")
