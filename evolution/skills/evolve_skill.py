@@ -24,6 +24,7 @@ from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, skill_feedback_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.lm import make_lm
+from evolution.core.metrics import load_metric, as_gepa_metric, as_float_metric
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -94,6 +95,7 @@ def evolve(
     eval_api_base: Optional[str] = None,
     eval_api_key: Optional[str] = None,
     skill_path_arg: Optional[str] = None,
+    metric: Optional[str] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -195,6 +197,14 @@ def evolve(
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
 
+    # Metric: built-in keyword-overlap proxy, or a user metric (--metric).
+    if metric:
+        user_metric = load_metric(metric)
+        gepa_metric, float_metric = as_gepa_metric(user_metric), as_float_metric(user_metric)
+        console.print(f"  Metric: {metric}")
+    else:
+        gepa_metric, float_metric = skill_feedback_metric, skill_fitness_metric
+
     # Configure DSPy
     lm = make_lm(eval_model, api_base=eval_api_base, api_key=eval_api_key)
     dspy.configure(lm=lm)
@@ -214,13 +224,13 @@ def evolve(
         console.print(f"  Metric-call budget: {budget}")
         opt = build_optimizer(
             "gepa",
-            metric=skill_feedback_metric,
+            metric=gepa_metric,
             reflection_lm=reflection_lm,
             max_metric_calls=budget,
         )
         compile_kwargs = dict(trainset=trainset, valset=valset)
     else:
-        opt = build_optimizer(optimizer, metric=skill_fitness_metric)
+        opt = build_optimizer(optimizer, metric=float_metric)
         compile_kwargs = dict(trainset=trainset)
 
     console.print(f"\n[bold cyan]Running {optimizer} optimization...[/bold cyan]\n")
@@ -266,11 +276,11 @@ def evolve(
         # Score baseline
         with dspy.context(lm=lm):
             baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
+            baseline_score = float_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
             evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
+            evolved_score = float_metric(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
@@ -371,13 +381,18 @@ def evolve(
               help="API key for --eval-api-base (prefer the env var)")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
+@click.option("--metric", "metric", default=None,
+              help="Metric as module:function or file.py:function (default: built-in keyword overlap)")
 def main(skill, skill_path, iterations, optimizer, max_metric_calls, eval_source, dataset_path, optimizer_model,
          eval_model, hermes_repo, optimizer_api_base, optimizer_api_key, eval_api_base, eval_api_key,
-         run_tests, dry_run):
+         run_tests, dry_run, metric):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     if not skill and not skill_path:
         raise click.UsageError("Give --skill, --skill-path, or both.")
+    if metric:
+        load_metric(metric)  # fail fast on a bad spec, before any model call
     evolve(
+        metric=metric,
         skill_name=skill,
         skill_path_arg=skill_path,
         iterations=iterations,
